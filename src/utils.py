@@ -12,9 +12,10 @@ def get_r(maturity = "DGS1", lookback_days = 14):
     end = dt.datetime.today()
     start = end - dt.timedelta(days = lookback_days)
     df = pdr.DataReader(maturity, "fred", start, end)
-    return float(df.dropna().iloc[-1, 0]) / 100.0
+    r = float(df.dropna().iloc[-1, 0]) / 100.0
+    return np.log1p(r)
 
-def filter_invalid(df, r = 0.0):
+def filter_invalid(df, r = 0.0, iv_max = None, bound_margin = 0.02, max_rel_spread = 1.0):
     S = df["S"].to_numpy()
     K = df["strike"].to_numpy()
     T = df["T"].to_numpy()
@@ -25,14 +26,27 @@ def filter_invalid(df, r = 0.0):
     spot_ok = S > 0.0
     price_ok = mid > 0.0
     moneyness_ok = np.abs(np.log(K / S)) <= 3.0
-    lower = np.empty_like(mid, dtype=float)
-    upper = np.empty_like(mid, dtype=float)
+    lower = np.empty_like(mid, dtype = float)
+    upper = np.empty_like(mid, dtype = float)
     for i in range(len(df)):
         l, u = noarb_bounds(S[i], K[i], r, q[i], T[i], typ[i])
         lower[i] = l
         upper[i] = u
-    bounds_ok = (mid >= lower) & (mid <= upper)
-    mask = time_ok & spot_ok & price_ok & moneyness_ok & bounds_ok
+    bounds_ok = (mid >= (1.0 + bound_margin) * lower) & (mid <= (1.0 - bound_margin) * upper)
+    if {"bid", "ask"}.issubset(df.columns):
+        bid = df["bid"].to_numpy()
+        ask = df["ask"].to_numpy()
+        mid_q = (bid + ask) / 2.0
+        rel_spread = (ask - bid) / np.maximum(1e-12, mid_q)
+        spread_ok = (bid > 0.0) & (ask > bid) & (rel_spread <= max_rel_spread)
+    else:
+        spread_ok = np.ones_like(mid, dtype = bool)
+    if ("iv" in df.columns) and (iv_max is not None):
+        iv = df["iv"].to_numpy()
+        iv_ok = (iv > 0.0) & (iv <= iv_max)
+    else:
+        iv_ok = np.ones_like(mid, dtype = bool)
+    mask = time_ok & spot_ok & price_ok & moneyness_ok & bounds_ok & spread_ok & iv_ok
     return df.loc[mask].reset_index(drop = True)
 
 def fetch_chain(tickers, r = 0.0):
@@ -98,10 +112,8 @@ def vega(S, K, r, q, sigma, T):
     pdf = np.exp(-0.5 * d1v * d1v) / np.sqrt(2.0 * np.pi)
     return S * np.exp(-q * T) * pdf * sqrt(T)
 
-def brenner_subrahmanyam(S, T, price):
-    if T <= 0 or S <= 0:
-        return 0.2
-    return np.clip(np.sqrt(2.0 * np.pi / T) * (price / S), 1e-4, 3.0)
+def brenner_subrahmanyam(S, T, V):
+    return np.clip(np.sqrt(2.0 * np.pi / T) * (V / S), 1e-4, 3.0)
 
 def noarb_bounds(S, K, r, q, T, type):
     disc_r = np.exp(-r * T)
@@ -112,15 +124,15 @@ def noarb_bounds(S, K, r, q, T, type):
         lower = max(0.0, K * disc_r - S * disc_q); upper = K * disc_r
     return lower, upper
 
-def iv_Newton(S, K, r, q, T, price, type, sigma0 = None, tol = 1e-8, max_iter = 20):
+def iv_Newton(S, K, r, q, T, V, type, sigma0 = None, tol = 1e-8, max_iter = 20):
     lower, upper = noarb_bounds(S, K, r, q, T, type)
-    if (price - lower) <= 1e-10 or (upper - price) <= 1e-10:
+    if (V - lower) <= 1e-10 or (upper - V) <= 1e-10:
         return 1e-6
-    sigma = sigma0 if sigma0 is not None else brenner_subrahmanyam(S, T, price)
+    sigma = sigma0 if sigma0 is not None else brenner_subrahmanyam(S, T, V)
     sigma = float(np.clip(sigma, 1e-4, 3.0))
     for _ in range(max_iter):
         model = black_scholes(S, K, r, q, sigma, T, type)
-        diff = model - price
+        diff = model - V
         if abs(diff) < tol:
             return float(sigma)
         v = vega(S, K, r, q, sigma, T)
@@ -128,19 +140,19 @@ def iv_Newton(S, K, r, q, T, price, type, sigma0 = None, tol = 1e-8, max_iter = 
         sigma = float(np.clip(sigma - step, 1e-6, 5.0))
     return np.nan
 
-def iv_bisect(S, K, r, q, T, price, type, lo = 1e-6, hi = 5.0, tol = 1e-8, max_iter = 100):
-    f_lo = black_scholes(S, K, r, q, lo, T, type) - price
-    f_hi = black_scholes(S, K, r, q, hi, T, type) - price
+def iv_bisect(S, K, r, q, T, V, type, lo = 1e-6, hi = 5.0, tol = 1e-8, max_iter = 100):
+    f_lo = black_scholes(S, K, r, q, lo, T, type) - V
+    f_hi = black_scholes(S, K, r, q, hi, T, type) - V
     tries = 0
     while f_lo * f_hi > 0 and hi < 10.0 and tries < 5:
         hi *= 1.5
-        f_hi = black_scholes(S, K, r, q, hi, T, type) - price
+        f_hi = black_scholes(S, K, r, q, hi, T, type) - V
         tries += 1
     a, b = lo, hi
     fa, fb = f_lo, f_hi
     for _ in range(max_iter):
         m = 0.5 * (a + b)
-        fm = black_scholes(S, K, r, q, m, T, type) - price
+        fm = black_scholes(S, K, r, q, m, T, type) - V
         if abs(fm) < tol or (b - a) < 1e-8:
             return float(m)
         if fa * fm <= 0:
@@ -164,7 +176,6 @@ def compute_iv(df, r = 0.0):
         lower, upper = noarb_bounds(S, K, r, q, T, typ)
         rel = (P - lower) / max(upper - lower, 1e-12)
         use_newton = (0.02 < rel < 0.98) and (T > 5/365) and (abs(np.log(K / S)) < 1.5)
-
         if use_newton:
             iv = iv_Newton(S, K, r, q, T, P, typ, sigma0 = last_sigma)
             if not np.isfinite(iv):
