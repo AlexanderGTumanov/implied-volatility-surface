@@ -21,7 +21,7 @@ The project is organized into two main directories. The `/notebooks` folder cont
 
 1. Clone this repository:
    ```bash
-   git clone <https://github.com/your-username/implied-volatility-surface>
+   git clone <https://github.com/AlexanderGTumanov/implied-volatility-surface>
    cd implied-volatility-surface
 
 ---
